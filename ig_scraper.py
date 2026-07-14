@@ -5,206 +5,305 @@ import json
 import threading
 import time
 import os
-import re
 import shutil
 import tempfile
+import re
+import random
+import webbrowser
 import socketserver
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
-# ── Config ──
 PORT = 9876
-HASHTAGS = ["emprendimiento", "motivacion", "dinero"]
 
 EXCLUDED = {
     'explore', 'reels', 'direct', 'accounts', 'stories', 'reel', 'p',
     'inbox', 'popular', 'locations', 'web', 'legal', 'about', 'help',
     'terms', 'privacy', 'lite', 'blog', 'careers', 'nometapolygon',
-    'meta_verified', 'tags', 'developer', 'session', 'emails', 'directory',
+    'meta_verified', 'tags', 'developer', 'session', 'emails', 'directory'
 }
 
-# ── Shared state ──
+HASHTAGS = [
+    # Emprendimiento
+    'emprendimiento', 'emprendedor', 'emprendedores', 'negociosonline',
+    'negociosdigitales', 'negociopropio', 'emprendedoreslatinos',
+    'emprendedorescolombianos', 'emprendimientodigital', 'startuplatam',
+    'mundoemprendedor', 'vidadeemprendedor', 'emprendedoresexitosos',
+    # Dinero y finanzas
+    'dinero', 'hacerdinero', 'ganardinero', 'libertadfinanciera',
+    'finanzaspersonales', 'educacionfinanciera', 'ingresosonline',
+    'ingresospasivos', 'riqueza', 'abundancia', 'inversionista',
+    'invertirenbolsa', 'criptomonedas', 'tradingforex',
+    # Motivación y mentalidad
+    'motivacion', 'motivacionpersonal', 'motivaciondiaria',
+    'mentalidadmillonaria', 'mentalidaddeexito', 'mentalidadganadora',
+    'mindsetemprendedor', 'mindsetmillonario', 'desarrollopersonal',
+    'superacionpersonal', 'crecimientopersonal', 'disciplina',
+    # Marketing y ventas
+    'marketingdigital', 'marketingonline', 'ventasonline',
+    'marcapersonal', 'brandingpersonal', 'socialmedamarketing',
+    'funneldeventas', 'copywriting', 'ecommerce',
+    # Masculinidad y lifestyle
+    'motivacionmasculina', 'masculinidad', 'hombredealto valor',
+    'highvalueman', 'estoicismo', 'redpill', 'sigmamale',
+    'hustle', 'grindset', 'grinding', 'selfimprovement',
+    # Liderazgo y éxito
+    'exito', 'exitoso', 'liderazgo', 'lider', 'ceo', 'founder',
+    'productividad', 'habitosexitosos', 'metasyobjetivos',
+    # English variants for broader reach
+    'entrepreneur', 'entrepreneurlife', 'entrepreneurmindset',
+    'makemoney', 'moneymindset', 'sidehustle', 'passiveincome',
+    'wealthbuilding', 'financialfreedom', 'motivation',
+    'successmindset', 'millionairemindset', 'businessowner',
+]
+
+HISTORY_FILE = os.path.expanduser("~/.ig_scraper_history.json")
+
 state = {
-    "running": False,
-    "count": 0,
-    "target": 100,
-    "status": "Listo para iniciar",
-    "hashtag": "",
-    "profiles": [],
-    "error": "",
+    'running': False,
+    'profiles': [],
+    'count': 0,
+    'target': 100,
+    'status': 'Listo para iniciar',
+    'hashtag': '',
 }
-state_lock = threading.Lock()
-scrape_thread = None
-driver_ref = [None]
+driver_ref = {'driver': None, 'tmp': None}
 
 
-def update_state(**kw):
-    with state_lock:
-        state.update(kw)
+def load_history():
+    try:
+        with open(HISTORY_FILE, 'r') as f:
+            return set(json.load(f))
+    except:
+        return set()
 
 
-def get_state():
-    with state_lock:
-        return dict(state)
+def save_history(profiles):
+    existing = load_history()
+    existing.update(profiles)
+    # Keep last 5000 to avoid infinite growth
+    trimmed = list(existing)[-5000:]
+    try:
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(trimmed, f)
+    except:
+        pass
 
 
-# ── Scraping logic ──
-def extract_usernames(driver):
-    """Pull every /<username>/ link from the current page."""
+def scrape_thread(target):
+    global state
+    state['running'] = True
+    state['profiles'] = []
+    state['count'] = 0
+    state['target'] = target
+    tmp_profile = None
+
+    history = load_history()
+
+    try:
+        state['status'] = 'Preparando Chrome...'
+        src = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+        tmp_profile = tempfile.mkdtemp(prefix="ig_scraper_")
+        driver_ref['tmp'] = tmp_profile
+        default_src = os.path.join(src, "Default")
+        default_dst = os.path.join(tmp_profile, "Default")
+        os.makedirs(default_dst, exist_ok=True)
+        for item in ["Cookies", "Login Data", "Web Data", "Preferences",
+                      "Secure Preferences", "Local State", "Network"]:
+            s = os.path.join(default_src, item)
+            d = os.path.join(default_dst, item)
+            if os.path.isdir(s):
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            elif os.path.exists(s):
+                shutil.copy2(s, d)
+        ls = os.path.join(src, "Local State")
+        if os.path.exists(ls):
+            shutil.copy2(ls, tmp_profile)
+
+        import undetected_chromedriver as uc
+        options = uc.ChromeOptions()
+        options.add_argument(f"--user-data-dir={tmp_profile}")
+        options.add_argument("--profile-directory=Default")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-popup-blocking")
+
+        state['status'] = 'Abriendo Chrome...'
+        driver = uc.Chrome(options=options, version_main=None)
+        driver_ref['driver'] = driver
+        driver.set_window_size(1200, 900)
+
+        state['status'] = 'Navegando a Instagram...'
+        driver.get("https://www.instagram.com/")
+        time.sleep(3)
+
+        own_user = None
+        try:
+            link = driver.execute_script("""
+                const a = document.querySelector('a[href*="/"][role="link"] img[alt]');
+                if (a) { const l = a.closest('a'); if (l) return l.getAttribute('href'); }
+                return null;
+            """)
+            if link:
+                m = re.match(r'^/([a-zA-Z0-9_.]+)/?$', link)
+                if m:
+                    own_user = m.group(1).lower()
+        except:
+            pass
+
+        collected = set()
+        skip = EXCLUDED | history | ({own_user} if own_user else set())
+
+        # Shuffle hashtags so each run explores different ones
+        tags = list(HASHTAGS)
+        random.shuffle(tags)
+        tag_index = 0
+
+        while len(collected) < target and state['running']:
+            if tag_index >= len(tags):
+                # Reshuffle and go again
+                random.shuffle(tags)
+                tag_index = 0
+
+            tag = tags[tag_index]
+            tag_index += 1
+
+            state['hashtag'] = tag
+            state['status'] = f'Buscando en #{tag}...'
+            print(f"[scrape] Visiting #{tag}")
+
+            driver.get(f"https://www.instagram.com/explore/tags/{tag}/")
+            time.sleep(3)
+
+            # Scroll to load more posts
+            for _ in range(5):
+                if not state['running']:
+                    break
+                driver.execute_script("window.scrollBy(0, window.innerHeight)")
+                time.sleep(0.7)
+
+            try:
+                post_links = driver.execute_script("""
+                    return Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
+                        .map(a => a.getAttribute('href'))
+                        .filter((v,i,a) => a.indexOf(v) === i);
+                """) or []
+            except:
+                post_links = []
+
+            if not post_links:
+                print(f"[scrape] #{tag}: no posts found, skipping")
+                continue
+
+            # Shuffle posts to avoid always hitting the same ones
+            random.shuffle(post_links)
+            state['status'] = f'#{tag}: {len(post_links)} posts, scrapeando...'
+            print(f"[scrape] #{tag}: {len(post_links)} posts")
+
+            # Open first post
+            driver.get("https://www.instagram.com" + post_links[0])
+            time.sleep(2)
+
+            stale = 0
+            for post_idx in range(len(post_links)):
+                if len(collected) >= target or not state['running']:
+                    break
+
+                # Extract ALL usernames from the current page
+                new_users = extract_all_usernames(driver, skip)
+                added = 0
+                for u in new_users:
+                    if u not in collected and len(collected) < target:
+                        collected.add(u)
+                        state['profiles'].append(u)
+                        added += 1
+
+                state['count'] = len(collected)
+
+                if added > 0:
+                    stale = 0
+                    state['status'] = f'#{tag}: {len(collected)}/{target} (+{added})'
+                    print(f"[scrape] #{tag} post {post_idx}: +{added} = {len(collected)}")
+                else:
+                    stale += 1
+
+                if stale > 5:
+                    break
+
+                # Navigate to next post via "Next" button
+                if not click_next(driver):
+                    # Try opening the next post directly
+                    if post_idx + 1 < len(post_links):
+                        driver.get("https://www.instagram.com" + post_links[post_idx + 1])
+                        time.sleep(1.5)
+                    else:
+                        break
+                else:
+                    time.sleep(0.5)
+
+        # Save to history
+        save_history(collected)
+
+        state['status'] = f'Completado: {len(collected)} perfiles únicos'
+        print(f"[done] {len(collected)} profiles")
+
+    except Exception as e:
+        print(f"[error] {e}")
+        state['status'] = f'Error: {str(e)[:100]}'
+    finally:
+        state['running'] = False
+        if driver_ref['driver']:
+            try:
+                driver_ref['driver'].quit()
+            except:
+                pass
+            driver_ref['driver'] = None
+        if tmp_profile and os.path.exists(tmp_profile):
+            shutil.rmtree(tmp_profile, ignore_errors=True)
+
+
+def extract_all_usernames(driver, skip):
     try:
         raw = driver.execute_script("""
             const out = new Set();
+            // Author from header
+            document.querySelectorAll('header a[href^="/"]').forEach(a => {
+                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                if (m) out.add(m[1].toLowerCase());
+            });
+            // All profile links
+            document.querySelectorAll('a[role="link"][href^="/"]').forEach(a => {
+                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                if (m) out.add(m[1].toLowerCase());
+            });
+            // Comment authors
+            document.querySelectorAll('ul a[href^="/"]').forEach(a => {
+                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                if (m) out.add(m[1].toLowerCase());
+            });
+            // Catch-all
             document.querySelectorAll('a[href^="/"]').forEach(a => {
                 const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
                 if (m) out.add(m[1].toLowerCase());
             });
             return [...out];
         """)
-        return [u for u in (raw or []) if u not in EXCLUDED]
+        return [u for u in (raw or []) if u not in skip]
     except Exception as e:
         print(f"[extract] error: {e}")
         return []
 
 
-def extract_from_post_page(driver):
-    """Extract username from a post's detail page via multiple selectors."""
-    try:
-        raw = driver.execute_script("""
-            const out = new Set();
-            // Method 1: header links (post author)
-            document.querySelectorAll('header a[href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            // Method 2: all profile links with role=link
-            document.querySelectorAll('a[role="link"][href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            // Method 3: comment authors
-            document.querySelectorAll('ul a[href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            // Method 4: any <a> matching username pattern
-            document.querySelectorAll('a[href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            return [...out];
-        """)
-        return [u for u in (raw or []) if u not in EXCLUDED]
-    except Exception as e:
-        print(f"[extract_post] error: {e}")
-        return []
-
-
-def scrape_hashtag_page(driver, hashtag, collected, target):
-    """Scrape profiles from a hashtag's explore page."""
-    update_state(status=f"Cargando #{hashtag}...", hashtag=hashtag)
-    url = f"https://www.instagram.com/explore/tags/{hashtag}/"
-    driver.get(url)
-    time.sleep(3)
-
-    # Scroll to load more posts
-    for i in range(5):
-        if not state["running"] or len(collected) >= target:
-            return
-        driver.execute_script("window.scrollBy(0, window.innerHeight)")
-        time.sleep(0.8)
-
-    # Get all post links
-    post_links = driver.execute_script("""
-        return Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
-            .map(a => a.getAttribute('href'))
-            .filter((v,i,a) => a.indexOf(v) === i);
-    """) or []
-
-    update_state(status=f"#{hashtag}: {len(post_links)} posts encontrados")
-    print(f"[{hashtag}] Found {len(post_links)} posts")
-
-    if not post_links:
-        return
-
-    # Open first post
-    driver.get("https://www.instagram.com" + post_links[0])
-    time.sleep(2)
-
-    visited = 0
-    stale = 0
-
-    while len(collected) < target and state["running"]:
-        # Extract usernames from current post
-        new_users = extract_from_post_page(driver)
-        added = 0
-        for u in new_users:
-            if u not in collected and len(collected) < target:
-                collected.add(u)
-                added += 1
-
-        if added > 0:
-            stale = 0
-            with state_lock:
-                state["profiles"] = list(collected)
-                state["count"] = len(collected)
-            update_state(
-                status=f"#{hashtag}: {len(collected)}/{target} perfiles (+{added})",
-            )
-            print(f"[{hashtag}] Post {visited}: +{added} = {len(collected)} total")
-        else:
-            stale += 1
-
-        visited += 1
-
-        if len(collected) >= target:
-            break
-
-        # Click "next" to go to next post
-        next_ok = click_next(driver)
-
-        if not next_ok or stale > 8:
-            print(f"[{hashtag}] Next failed or stale, trying more posts...")
-            # Go back to hashtag page, scroll more, try again
-            driver.get(url)
-            time.sleep(2)
-            for i in range(3 + visited // 3):
-                if not state["running"]:
-                    return
-                driver.execute_script("window.scrollBy(0, window.innerHeight)")
-                time.sleep(0.6)
-
-            post_links = driver.execute_script("""
-                return Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
-                    .map(a => a.getAttribute('href'))
-                    .filter((v,i,a) => a.indexOf(v) === i);
-            """) or []
-
-            if not post_links:
-                break
-
-            # Pick a post we haven't likely visited
-            idx = min(visited, len(post_links) - 1)
-            driver.get("https://www.instagram.com" + post_links[idx])
-            time.sleep(2)
-            stale = 0
-        else:
-            time.sleep(0.6)
-
-
 def click_next(driver):
-    """Click the 'Next' arrow button on a post modal/page."""
     try:
         clicked = driver.execute_script("""
-            // Try aria-labels in multiple languages
             const labels = ['Siguiente', 'Next', 'Próximo', 'Avançar'];
             for (const label of labels) {
-                // SVG with aria-label
                 const svg = document.querySelector(`svg[aria-label="${label}"]`);
                 if (svg) {
                     const btn = svg.closest('button') || svg.closest('[role="button"]') || svg;
                     btn.click();
                     return true;
                 }
-                // Button or div with aria-label
                 const el = document.querySelector(`[aria-label="${label}"]`);
                 if (el) {
                     const btn = el.closest('button') || el;
@@ -212,7 +311,6 @@ def click_next(driver):
                     return true;
                 }
             }
-            // Fallback: right arrow button by position
             const buttons = document.querySelectorAll('button');
             for (const b of buttons) {
                 const rect = b.getBoundingClientRect();
@@ -232,124 +330,8 @@ def click_next(driver):
         return False
 
 
-def scrape_explore(driver, collected, target):
-    """Fallback: scrape the main Explore grid."""
-    update_state(status="Cargando Explorar...", hashtag="explore")
-    driver.get("https://www.instagram.com/explore/")
-    time.sleep(3)
-
-    for i in range(5):
-        if not state["running"]:
-            return
-        driver.execute_script("window.scrollBy(0, window.innerHeight)")
-        time.sleep(0.8)
-
-    post_links = driver.execute_script("""
-        return Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
-            .map(a => a.getAttribute('href'))
-            .filter((v,i,a) => a.indexOf(v) === i);
-    """) or []
-
-    if not post_links:
-        return
-
-    driver.get("https://www.instagram.com" + post_links[0])
-    time.sleep(2)
-
-    for _ in range(len(post_links) * 2):
-        if not state["running"] or len(collected) >= target:
-            break
-        new_users = extract_from_post_page(driver)
-        for u in new_users:
-            if u not in collected and len(collected) < target:
-                collected.add(u)
-        with state_lock:
-            state["profiles"] = list(collected)
-            state["count"] = len(collected)
-        update_state(status=f"Explorar: {len(collected)}/{target} perfiles")
-
-        if not click_next(driver):
-            break
-        time.sleep(0.6)
-
-
-def run_scraper(target):
-    """Main scraping loop."""
-    try:
-        update_state(running=True, count=0, profiles=[], status="Abriendo Chrome...", error="")
-
-        import undetected_chromedriver as uc
-
-        # Copy Chrome profile to temp dir to avoid conflicts
-        update_state(status="Preparando perfil de Chrome...")
-        chrome_src = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-        tmp_dir = tempfile.mkdtemp(prefix="ig_scraper_")
-        default_dst = os.path.join(tmp_dir, "Default")
-        os.makedirs(default_dst, exist_ok=True)
-
-        for item in ["Cookies", "Login Data", "Web Data", "Preferences",
-                      "Secure Preferences", "Network"]:
-            src = os.path.join(chrome_src, "Default", item)
-            dst = os.path.join(default_dst, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            elif os.path.exists(src):
-                shutil.copy2(src, dst)
-
-        local_state = os.path.join(chrome_src, "Local State")
-        if os.path.exists(local_state):
-            shutil.copy2(local_state, tmp_dir)
-
-        options = uc.ChromeOptions()
-        options.add_argument(f"--user-data-dir={tmp_dir}")
-        options.add_argument("--profile-directory=Default")
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--disable-popup-blocking")
-
-        update_state(status="Iniciando Chrome...")
-        driver = uc.Chrome(options=options, version_main=None)
-        driver_ref[0] = driver
-        driver.set_window_size(1200, 900)
-
-        collected = set()
-
-        # Scrape each hashtag
-        for hashtag in HASHTAGS:
-            if not state["running"] or len(collected) >= target:
-                break
-            scrape_hashtag_page(driver, hashtag, collected, target)
-
-        # If still not enough, use Explore
-        if len(collected) < target and state["running"]:
-            scrape_explore(driver, collected, target)
-
-        with state_lock:
-            state["profiles"] = list(collected)
-            state["count"] = len(collected)
-
-        update_state(
-            running=False,
-            status=f"Completado: {len(collected)} perfiles únicos",
-        )
-        print(f"[done] {len(collected)} profiles collected")
-
-    except Exception as e:
-        print(f"[error] {e}")
-        update_state(running=False, status=f"Error: {str(e)[:120]}", error=str(e))
-    finally:
-        if driver_ref[0]:
-            try:
-                driver_ref[0].quit()
-            except:
-                pass
-            driver_ref[0] = None
-        if tmp_dir and os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-# ── Web server ──
-HTML = """<!DOCTYPE html>
+# ── HTML ──
+HTML_PAGE = '''<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
@@ -388,7 +370,10 @@ h1 { text-align: center; font-size: 32px; font-weight: 800; background: linear-g
 .bottom-actions { display: flex; gap: 10px; margin-top: 16px; }
 .btn-copy, .btn-save { flex: 1; padding: 14px; border: 2px solid #1a5276; border-radius: 10px; background: transparent; color: #3498db; font-size: 14px; font-weight: 700; cursor: pointer; transition: all 0.2s; }
 .btn-copy:hover, .btn-save:hover { background: #1a5276; color: #fff; }
+.btn-clear { padding: 14px; border: 2px solid #6b2d2d; border-radius: 10px; background: transparent; color: #e74c3c; font-size: 14px; font-weight: 700; cursor: pointer; transition: all 0.2s; }
+.btn-clear:hover { background: #6b2d2d; color: #fff; }
 .toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #00ff88; color: #000; padding: 12px 24px; border-radius: 8px; font-weight: 700; display: none; z-index: 999; }
+.history-info { text-align: center; color: #444; font-size: 11px; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -427,7 +412,9 @@ h1 { text-align: center; font-size: 32px; font-weight: 800; background: linear-g
     <div class="bottom-actions">
         <button class="btn-copy" onclick="copyAll()">COPIAR TODO</button>
         <button class="btn-save" onclick="saveFile()">GUARDAR .TXT</button>
+        <button class="btn-clear" onclick="clearHistory()">LIMPIAR HISTORIAL</button>
     </div>
+    <div class="history-info" id="historyInfo"></div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -446,6 +433,11 @@ amounts.forEach(amt => {
     amountsDiv.appendChild(btn);
 });
 
+fetch('/history_count').then(r=>r.json()).then(d => {
+    if (d.count > 0) document.getElementById('historyInfo').textContent =
+        d.count + ' perfiles en historial (no se repetiran)';
+});
+
 function selectAmount(amt) {
     selectedAmount = amt;
     amounts.forEach(a => {
@@ -461,7 +453,6 @@ function startScrape() {
     document.getElementById('counter').innerHTML = '0 <span>/ ' + selectedAmount + '</span>';
     document.getElementById('progressFill').style.width = '0%';
     document.getElementById('resultCount').textContent = '0';
-
     fetch('/start?amount=' + selectedAmount).then(() => {
         polling = setInterval(pollStatus, 1000);
     });
@@ -474,24 +465,24 @@ function pollStatus() {
         document.getElementById('counter').innerHTML = data.count + ' <span>/ ' + data.target + '</span>';
         document.getElementById('status').textContent = data.status;
         document.getElementById('resultCount').textContent = data.count;
-
         const pct = data.target > 0 ? Math.min(Math.round(data.count / data.target * 100), 100) : 0;
         document.getElementById('progressFill').style.width = pct + '%';
-
         if (data.hashtag) {
             document.getElementById('hashBadge').innerHTML = '<span class="hashtag-badge">#' + data.hashtag + '</span>';
         }
-
         if (data.profiles && data.profiles.length > 0) {
             document.getElementById('resultsList').textContent = data.profiles.join('\\n');
             document.getElementById('resultsList').scrollTop = document.getElementById('resultsList').scrollHeight;
         }
-
         if (!data.running && polling) {
             clearInterval(polling);
             polling = null;
             document.getElementById('btnStart').disabled = false;
             if (data.count > 0) showToast('Scraping completado: ' + data.count + ' perfiles');
+            fetch('/history_count').then(r=>r.json()).then(d => {
+                document.getElementById('historyInfo').textContent =
+                    d.count + ' perfiles en historial (no se repetiran)';
+            });
         }
     }).catch(() => {});
 }
@@ -517,6 +508,15 @@ function saveFile() {
     });
 }
 
+function clearHistory() {
+    if (confirm('Borrar historial? Esto permite volver a encontrar perfiles anteriores.')) {
+        fetch('/clear_history').then(() => {
+            document.getElementById('historyInfo').textContent = 'Historial limpiado';
+            showToast('Historial borrado');
+        });
+    }
+}
+
 function showToast(msg) {
     const t = document.getElementById('toast');
     t.textContent = msg;
@@ -525,71 +525,71 @@ function showToast(msg) {
 }
 </script>
 </body>
-</html>"""
+</html>'''
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass  # suppress request logs
-
-    def _json(self, data, code=200):
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def _html(self, html):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(html.encode())
+    def log_message(self, format, *args):
+        pass
 
     def do_GET(self):
-        global scrape_thread
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        if path == "/":
-            self._html(HTML)
+        if path == '/':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
 
-        elif path == "/status":
-            self._json(get_state())
+        elif path == '/start':
+            amount = int(params.get('amount', [100])[0])
+            if not state['running']:
+                threading.Thread(target=scrape_thread, args=(amount,), daemon=True).start()
+            self._json({'ok': True})
 
-        elif path == "/start":
-            if state["running"]:
-                self._json({"ok": False, "msg": "already running"})
-                return
-            target = int(params.get("amount", [100])[0])
-            update_state(target=target)
-            scrape_thread = threading.Thread(target=run_scraper, args=(target,), daemon=True)
-            scrape_thread.start()
-            self._json({"ok": True})
+        elif path == '/stop':
+            state['running'] = False
+            self._json({'ok': True})
 
-        elif path == "/stop":
-            update_state(running=False, status="Detenido por el usuario")
-            if driver_ref[0]:
-                try:
-                    driver_ref[0].quit()
-                except:
-                    pass
-                driver_ref[0] = None
-            self._json({"ok": True})
+        elif path == '/status':
+            self._json({
+                'running': state['running'],
+                'count': state['count'],
+                'target': state['target'],
+                'status': state['status'],
+                'hashtag': state.get('hashtag', ''),
+                'profiles': state['profiles'],
+            })
+
+        elif path == '/history_count':
+            self._json({'count': len(load_history())})
+
+        elif path == '/clear_history':
+            try:
+                os.remove(HISTORY_FILE)
+            except:
+                pass
+            self._json({'ok': True})
 
         else:
             self.send_error(404)
 
+    def _json(self, data):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
 
-class ReusableTCPServer(socketserver.TCPServer):
-    allow_reuse_address = True
 
-
-if __name__ == "__main__":
-    print(f"IG Niche Scraper corriendo en http://localhost:{PORT}")
-    server = ReusableTCPServer(("", PORT), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nDetenido.")
-        server.shutdown()
+if __name__ == '__main__':
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(('', PORT), Handler) as httpd:
+        print(f"IG Niche Scraper corriendo en http://localhost:{PORT}")
+        webbrowser.open(f'http://localhost:{PORT}')
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
