@@ -209,7 +209,7 @@ def scrape_thread(target):
                     break
 
                 # Extract ALL usernames from the current page
-                new_users = extract_all_usernames(driver, skip)
+                new_users = extract_post_author(driver, skip)
                 added = 0
                 for u in new_users:
                     if u not in collected and len(collected) < target:
@@ -261,33 +261,26 @@ def scrape_thread(target):
             shutil.rmtree(tmp_profile, ignore_errors=True)
 
 
-def extract_all_usernames(driver, skip):
+def extract_post_author(driver, skip):
     try:
         raw = driver.execute_script("""
-            const out = new Set();
-            // Author from header
-            document.querySelectorAll('header a[href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            // All profile links
-            document.querySelectorAll('a[role="link"][href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            // Comment authors
-            document.querySelectorAll('ul a[href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            // Catch-all
-            document.querySelectorAll('a[href^="/"]').forEach(a => {
-                const m = a.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) out.add(m[1].toLowerCase());
-            });
-            return [...out];
+            // Only the post author from the header
+            const header = document.querySelector('header a[href^="/"]');
+            if (header) {
+                const m = header.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                if (m) return m[1].toLowerCase();
+            }
+            // Fallback: first profile link in article
+            const article = document.querySelector('article a[href^="/"]');
+            if (article) {
+                const m = article.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                if (m) return m[1].toLowerCase();
+            }
+            return null;
         """)
-        return [u for u in (raw or []) if u not in skip]
+        if raw and raw not in skip:
+            return [raw]
+        return []
     except Exception as e:
         print(f"[extract] error: {e}")
         return []
