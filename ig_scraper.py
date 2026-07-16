@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import os
+import sys
 import shutil
 import tempfile
 import re
@@ -101,40 +102,68 @@ def scrape_thread(target):
 
     try:
         state['status'] = 'Preparando Chrome...'
-        src = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-        tmp_profile = tempfile.mkdtemp(prefix="ig_scraper_")
-        driver_ref['tmp'] = tmp_profile
-        default_src = os.path.join(src, "Default")
-        default_dst = os.path.join(tmp_profile, "Default")
-        os.makedirs(default_dst, exist_ok=True)
-        for item in ["Cookies", "Login Data", "Web Data", "Preferences",
-                      "Secure Preferences", "Local State", "Network"]:
-            s = os.path.join(default_src, item)
-            d = os.path.join(default_dst, item)
-            if os.path.isdir(s):
-                shutil.copytree(s, d, dirs_exist_ok=True)
-            elif os.path.exists(s):
-                shutil.copy2(s, d)
-        ls = os.path.join(src, "Local State")
-        if os.path.exists(ls):
-            shutil.copy2(ls, tmp_profile)
 
-        import undetected_chromedriver as uc
-        options = uc.ChromeOptions()
-        options.add_argument(f"--user-data-dir={tmp_profile}")
-        options.add_argument("--profile-directory=Default")
+        driver_ref['tmp'] = None
+
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+
+        # Use a dedicated persistent profile — user logs in once, session persists
+        scraper_profile = os.path.expanduser("~/.ig_scraper_chrome")
+
+        options = Options()
+        options.add_argument(f"--user-data-dir={scraper_profile}")
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
         options.add_argument("--disable-popup-blocking")
+        options.add_argument("--window-size=1200,900")
 
         state['status'] = 'Abriendo Chrome...'
-        driver = uc.Chrome(options=options, version_main=None)
+        print("[scrape] Launching Chrome with persistent profile...", flush=True)
+        driver = webdriver.Chrome(options=options)
+        print(f"[scrape] Chrome launched OK", flush=True)
+
         driver_ref['driver'] = driver
-        driver.set_window_size(1200, 900)
 
         state['status'] = 'Navegando a Instagram...'
+        print("[scrape] Navigating to Instagram...", flush=True)
         driver.get("https://www.instagram.com/")
-        time.sleep(3)
+        time.sleep(5)
+        print(f"[scrape] On Instagram, title: {driver.title}", flush=True)
+
+        # Check if logged in — if not, wait for user to log in (up to 3 minutes)
+        def check_logged_in():
+            try:
+                return driver.execute_script("""
+                    return document.querySelector('a[href*="/direct/"]') !== null
+                        || document.querySelector('svg[aria-label="Inicio"]') !== null
+                        || document.querySelector('svg[aria-label="Home"]') !== null
+                        || document.querySelector('svg[aria-label="Nueva publicación"]') !== null
+                        || document.querySelector('svg[aria-label="New post"]') !== null
+                        || document.querySelector('span[aria-label="Inicio"]') !== null;
+                """)
+            except:
+                return False
+
+        is_logged = check_logged_in()
+        if is_logged:
+            print("[scrape] Already logged in!", flush=True)
+        else:
+            state['status'] = '⏳ Inicia sesión en Instagram en la ventana de Chrome...'
+            print("[scrape] NOT logged in. Waiting for user to log in...", flush=True)
+            for wait in range(90):
+                if not state['running']:
+                    return
+                time.sleep(2)
+                is_logged = check_logged_in()
+                if is_logged:
+                    print(f"[scrape] User logged in after {wait*2}s!", flush=True)
+                    break
+                if wait % 15 == 0 and wait > 0:
+                    state['status'] = f'⏳ Esperando login en Chrome... ({180 - wait*2}s restantes)'
+            if not is_logged:
+                state['status'] = 'Error: no iniciaste sesión en Instagram. Intenta de nuevo.'
+                raise Exception("Timeout esperando login de Instagram")
 
         own_user = None
         try:
@@ -160,7 +189,6 @@ def scrape_thread(target):
 
         while len(collected) < target and state['running']:
             if tag_index >= len(tags):
-                # Reshuffle and go again
                 random.shuffle(tags)
                 tag_index = 0
 
@@ -169,46 +197,53 @@ def scrape_thread(target):
 
             state['hashtag'] = tag
             state['status'] = f'Buscando en #{tag}...'
-            print(f"[scrape] Visiting #{tag}")
+            print(f"[scrape] Visiting #{tag}", flush=True)
 
             driver.get(f"https://www.instagram.com/explore/tags/{tag}/")
-            time.sleep(3)
+            time.sleep(4)
 
-            # Scroll to load more posts
-            for _ in range(5):
+            # Scroll to load more post thumbnails
+            for scroll in range(5):
                 if not state['running']:
                     break
                 driver.execute_script("window.scrollBy(0, window.innerHeight)")
-                time.sleep(0.7)
+                time.sleep(0.8)
 
-            try:
-                post_links = driver.execute_script("""
-                    return Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
-                        .map(a => a.getAttribute('href'))
-                        .filter((v,i,a) => a.indexOf(v) === i);
-                """) or []
-            except:
-                post_links = []
+            # Get all post thumbnail links
+            post_links = driver.execute_script("""
+                return Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'))
+                    .map(a => a.getAttribute('href'))
+                    .filter((v,i,a) => a.indexOf(v) === i);
+            """) or []
 
             if not post_links:
-                print(f"[scrape] #{tag}: no posts found, skipping")
+                print(f"[scrape] #{tag}: no posts found", flush=True)
                 continue
 
-            # Shuffle posts to avoid always hitting the same ones
             random.shuffle(post_links)
-            state['status'] = f'#{tag}: {len(post_links)} posts, scrapeando...'
-            print(f"[scrape] #{tag}: {len(post_links)} posts")
+            print(f"[scrape] #{tag}: {len(post_links)} posts, clicking thumbnails...", flush=True)
 
-            # Open first post
-            driver.get("https://www.instagram.com" + post_links[0])
-            time.sleep(2)
-
-            stale = 0
-            for post_idx in range(len(post_links)):
+            tag_added = 0
+            for post_idx, post_href in enumerate(post_links):
                 if len(collected) >= target or not state['running']:
                     break
 
-                # Extract ALL usernames from the current page
+                # Click the thumbnail to open as modal (not navigate)
+                try:
+                    clicked = driver.execute_script("""
+                        var link = document.querySelector('a[href="' + arguments[0] + '"]');
+                        if (link) { link.click(); return true; }
+                        return false;
+                    """, post_href)
+                except:
+                    clicked = False
+
+                if not clicked:
+                    continue
+
+                time.sleep(2)
+
+                # Extract author from the modal
                 new_users = extract_post_author(driver, skip)
                 added = 0
                 for u in new_users:
@@ -216,38 +251,37 @@ def scrape_thread(target):
                         collected.add(u)
                         state['profiles'].append(u)
                         added += 1
+                        tag_added += 1
 
                 state['count'] = len(collected)
 
                 if added > 0:
-                    stale = 0
                     state['status'] = f'#{tag}: {len(collected)}/{target} (+{added})'
-                    print(f"[scrape] #{tag} post {post_idx}: +{added} = {len(collected)}")
-                else:
-                    stale += 1
+                    print(f"[scrape] #{tag} post {post_idx}: +{added} = {len(collected)}", flush=True)
 
-                if stale > 5:
-                    break
+                # Close the modal by pressing Escape
+                try:
+                    from selenium.webdriver.common.keys import Keys
+                    driver.find_element("tag name", "body").send_keys(Keys.ESCAPE)
+                except:
+                    # Fallback: navigate back
+                    try:
+                        driver.back()
+                    except:
+                        pass
+                time.sleep(1)
 
-                # Navigate to next post via "Next" button
-                if not click_next(driver):
-                    # Try opening the next post directly
-                    if post_idx + 1 < len(post_links):
-                        driver.get("https://www.instagram.com" + post_links[post_idx + 1])
-                        time.sleep(1.5)
-                    else:
-                        break
-                else:
-                    time.sleep(0.5)
+            if tag_added == 0:
+                print(f"[scrape] #{tag}: no new users found", flush=True)
 
         # Save to history
         save_history(collected)
 
         state['status'] = f'Completado: {len(collected)} perfiles únicos'
-        print(f"[done] {len(collected)} profiles")
+        print(f"[done] {len(collected)} profiles", flush=True)
 
     except Exception as e:
-        print(f"[error] {e}")
+        print(f"[error] {e}", flush=True)
         state['status'] = f'Error: {str(e)[:100]}'
     finally:
         state['running'] = False
@@ -257,33 +291,69 @@ def scrape_thread(target):
             except:
                 pass
             driver_ref['driver'] = None
-        if tmp_profile and os.path.exists(tmp_profile):
-            shutil.rmtree(tmp_profile, ignore_errors=True)
 
 
 def extract_post_author(driver, skip):
     try:
-        raw = driver.execute_script("""
-            // Only the post author from the header
-            const header = document.querySelector('header a[href^="/"]');
-            if (header) {
-                const m = header.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) return m[1].toLowerCase();
-            }
-            // Fallback: first profile link in article
-            const article = document.querySelector('article a[href^="/"]');
-            if (article) {
-                const m = article.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
-                if (m) return m[1].toLowerCase();
-            }
+        user = driver.execute_script("""
+            try {
+                // Look inside the modal/dialog first, then fall back to full page
+                var scope = document.querySelector('div[role="dialog"]') || document;
+
+                // Method 1: Inside modal — find profile pic alt text
+                var imgs = scope.querySelectorAll('img[alt]');
+                for (var i = 0; i < imgs.length; i++) {
+                    var alt = imgs[i].alt || '';
+                    if (alt.indexOf('profile picture') >= 0 || alt.indexOf('Foto del perfil') >= 0) {
+                        var name = alt.replace(/foto del perfil de /i, '').replace(/'s profile picture/i, '').replace(/Foto del perfil de /i, '').trim();
+                        if (name && /^[a-zA-Z0-9_.]{2,30}$/.test(name)) {
+                            var link = imgs[i].closest('a[href^="/"]');
+                            if (link) {
+                                var hm = link.getAttribute('href').match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                                if (hm) return 'modal-img|' + hm[1].toLowerCase();
+                            }
+                            return 'modal-alt|' + name.toLowerCase();
+                        }
+                    }
+                }
+
+                // Method 2: Inside modal — first username link
+                var links = scope.querySelectorAll('a[href^="/"]');
+                for (var j = 0; j < links.length; j++) {
+                    var href = links[j].getAttribute('href');
+                    if (['/','/reels/','/explore/','/direct/','/accounts/'].indexOf(href) >= 0) continue;
+                    if (href.indexOf('/p/') === 0 || href.indexOf('/reel/') === 0 || href.indexOf('/explore/') === 0 || href.indexOf('/stories/') === 0) continue;
+                    var lm = href.match(/^\\/([a-zA-Z0-9_.]{2,30})\\/?$/);
+                    if (lm) return 'modal-link|' + lm[1].toLowerCase();
+                }
+
+                // Method 3: meta tags (work when navigated to a post page)
+                var el = document.querySelector('meta[property="og:description"]');
+                if (el) {
+                    var c = el.getAttribute('content') || '';
+                    var m = c.match(/@([a-zA-Z0-9_.]{2,30})/);
+                    if (m) return 'og:desc|' + m[1].toLowerCase();
+                }
+            } catch(e) {}
             return null;
         """)
-        if raw and raw not in skip:
-            return [raw]
+        if user:
+            parts = user.split('|', 1)
+            method = parts[0]
+            username = parts[1] if len(parts) > 1 else user
+            print(f"[extract] OK method={method} user={username}", flush=True)
+            if username not in skip:
+                return [username]
+            else:
+                print(f"[extract] {username} in skip set", flush=True)
+        else:
+            print(f"[extract] FAIL - returned null", flush=True)
         return []
     except Exception as e:
-        print(f"[extract] error: {e}")
+        print(f"[extract] error: {e}", flush=True)
         return []
+
+
 
 
 def click_next(driver):
@@ -373,6 +443,7 @@ h1 { text-align: center; font-size: 32px; font-weight: 800; background: linear-g
 <div class="app">
     <h1>IG NICHE SCRAPER</h1>
     <p class="subtitle">EMPRENDIMIENTO &middot; MOTIVACION &middot; DINERO</p>
+    <p style="text-align:center;color:#fcb045;font-size:12px;margin-bottom:8px">La primera vez: inicia sesion en Instagram en el Chrome que se abra. Despues ya no sera necesario.</p>
 
     <div class="section">
         <div class="section-title">CANTIDAD DE PERFILES</div>
@@ -566,6 +637,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             self._json({'ok': True})
 
+        elif path == '/debug':
+            if driver_ref['driver']:
+                try:
+                    info = driver_ref['driver'].execute_script("""
+                        return {
+                            url: window.location.href,
+                            title: document.title,
+                            bodyLen: document.body ? document.body.innerHTML.length : 0,
+                            metas: Array.from(document.querySelectorAll('meta[property]')).slice(0,10).map(m => m.getAttribute('property') + '=' + (m.getAttribute('content')||'').substring(0,80)),
+                            imgs: Array.from(document.querySelectorAll('img[alt]')).slice(0,10).map(i => i.alt.substring(0,60)),
+                            links: Array.from(document.querySelectorAll('a[href^="/"]')).slice(0,15).map(a => a.getAttribute('href')),
+                        };
+                    """)
+                    self._json(info)
+                except Exception as e:
+                    self._json({'error': str(e)})
+            else:
+                self._json({'error': 'no driver'})
+
         else:
             self.send_error(404)
 
@@ -580,7 +670,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == '__main__':
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(('', PORT), Handler) as httpd:
-        print(f"IG Niche Scraper corriendo en http://localhost:{PORT}")
+        print(f"IG Niche Scraper corriendo en http://localhost:{PORT}", flush=True)
         webbrowser.open(f'http://localhost:{PORT}')
         try:
             httpd.serve_forever()
